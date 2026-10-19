@@ -15,11 +15,16 @@ export default function LoginPage() {
   useEffect(() => {
     (async () => {
       try {
-        const res = await fetch("/api/auth/me");
-        const data = await res.json();
+        const checkSession = fetch("/api/auth/me").then((res) => res.json());
+        // Never leave the page stuck on "Loading…": if the server does not
+        // answer within 5s (e.g. DB connectivity problem), show the login form.
+        const slowServer = new Promise<{ user: unknown }>((resolve) =>
+          setTimeout(() => resolve({ user: null }), 5000)
+        );
+        const data = await Promise.race([checkSession, slowServer]);
         if (data.user) router.replace("/dashboard");
       } catch {
-        /* not authed */
+        /* not authed or server error */
       } finally {
         setChecking(false);
       }

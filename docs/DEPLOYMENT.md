@@ -69,7 +69,8 @@ is one file in a persistent volume.
 4. **General** tab:
    - Base Domain: e.g. `blogpilot.example.com` (proxy + HTTPS auto-enabled)
    - Ports Exposes: `3000`
-   - Health Check: path `/login`, or leave Coolify default.
+   - Health Check: path **`/api/health`** (returns 200 when the database is
+     reachable, 503 with the error when it is not).
 5. **Advanced** tab → **Persistent Storage**: add one volume:
 
    | Volume | Destination |
