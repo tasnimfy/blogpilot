@@ -2,7 +2,6 @@
 
 import { useEffect, useState } from "react";
 import { useRouter } from "next/navigation";
-import Link from "next/link";
 
 export default function LoginPage() {
   const router = useRouter();
@@ -10,23 +9,18 @@ export default function LoginPage() {
   const [password, setPassword] = useState("");
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
-  const [checking, setChecking] = useState(true);
 
+  // Progressive enhancement: if a valid session exists, send the user to the
+  // dashboard. The login form is ALWAYS rendered by the server first, so the
+  // page can never get stuck on a "Loading…" screen.
   useEffect(() => {
     (async () => {
       try {
-        const checkSession = fetch("/api/auth/me").then((res) => res.json());
-        // Never leave the page stuck on "Loading…": if the server does not
-        // answer within 5s (e.g. DB connectivity problem), show the login form.
-        const slowServer = new Promise<{ user: unknown }>((resolve) =>
-          setTimeout(() => resolve({ user: null }), 5000)
-        );
-        const data = await Promise.race([checkSession, slowServer]);
+        const res = await fetch("/api/auth/me");
+        const data = await res.json();
         if (data.user) router.replace("/dashboard");
       } catch {
-        /* not authed or server error */
-      } finally {
-        setChecking(false);
+        /* not authed or server error — stay on the login form */
       }
     })();
   }, [router]);
@@ -53,8 +47,6 @@ export default function LoginPage() {
       setLoading(false);
     }
   }
-
-  if (checking) return <div className="flex min-h-screen items-center justify-center text-sm text-slate-500">Loading…</div>;
 
   return (
     <div className="flex min-h-screen items-center justify-center bg-slate-50 px-4">
