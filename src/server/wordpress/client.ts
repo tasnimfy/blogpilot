@@ -28,7 +28,10 @@ export class WordPressClient {
   private siteUrl: string;
   private username: string;
   private appPassword: string;
-  readonly restBase: string;
+  // Active REST base. Starts as the pretty-permalink form
+  // ({site}/wp-json/wp/v2) and may be switched to the core query form
+  // ({site}/?rest_route=/wp/v2) by test() on sites with plain permalinks.
+  restBase: string;
 
   constructor(info: WpConnectionInfo) {
     assertSafeOutboundUrl(info.siteUrl, "WordPress site URL");
@@ -38,9 +41,18 @@ export class WordPressClient {
     this.restBase = `${this.siteUrl}/wp-json/wp/v2`;
   }
 
+  // Joins a path onto the active REST base. When the query form is in use the
+  // base already contains "?", so a path's own query string must be joined
+  // with "&" (e.g. /categories?per_page=100 -> ?rest_route=/wp/v2/categories&per_page=100).
+  private buildUrl(path: string): string {
+    if (path.startsWith("http")) return path;
+    if (this.restBase.includes("?")) return `${this.restBase}${path.replace("?", "&")}`;
+    return `${this.restBase}${path}`;
+  }
+
   private async raw(path: string, opts: RequestOptions = {}): Promise<Response> {
     assertSafeOutboundUrl(this.siteUrl, "WordPress site URL");
-    const url = path.startsWith("http") ? path : `${this.restBase}${path}`;
+    const url = this.buildUrl(path);
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), opts.timeoutMs ?? 30_000);
     const headers: Record<string, string> = {
@@ -87,12 +99,64 @@ export class WordPressClient {
     return this.parse(res);
   }
 
-  // Connection test: hits the WP REST index which requires auth.
+  // Connection test: reach the WP REST API root, which requires and reflects
+  // authentication. Two real-world cases are handled explicitly:
+  //  - "Plain" permalink sites do not serve /wp-json/*; WordPress still serves
+  //    the same API via the core ?rest_route= query form, so fall back to it
+  //    (and keep using it for the follow-up capability probes below).
+  //  - A blank site title (name: "") is a valid, working connection; the site
+  //    host is used as the display label instead of failing the test.
   async test(): Promise<{ name: string; url: string; description?: string }> {
-    const res = await this.raw("");
-    const data = (await this.parse(res)) as { name?: string; url?: string; description?: string };
-    if (!data.name) throw new WordPressError("Connected but no site name returned", 502);
-    return { name: data.name, url: data.url ?? this.siteUrl, description: data.description };
+    const prettyBase = `${this.siteUrl}/wp-json/wp/v2`;
+    const queryBase = `${this.siteUrl}/?rest_route=/wp/v2`;
+    let lastError: WordPressError | null = null;
+
+    for (const base of [prettyBase, queryBase]) {
+      this.restBase = base;
+      let data: { name?: string; url?: string; description?: string } | null;
+      try {
+        data = (await this.request("")) as { name?: string; url?: string; description?: string } | null;
+      } catch (e) {
+        lastError = e instanceof WordPressError ? e : null;
+        continue; // try the next REST base form
+      }
+      if (!data || typeof data !== "object" || Array.isArray(data)) {
+        lastError = new WordPressError(
+          `${base} did not return the WordPress REST API index. The Site URL may not point at this ` +
+            `WordPress site's homepage, or a security/caching plugin, firewall, or "coming soon" page is intercepting the request.`,
+          502
+        );
+        continue;
+      }
+      // A genuine WP REST root always carries the site url. Random JSON from a
+      // proxy/WAF (e.g. {"error":"..."}) does not, so require it before calling
+      // this a successful connection.
+      if (typeof data.url !== "string" || !data.url) {
+        lastError = new WordPressError(
+          `${base} responded with JSON that is not the WordPress REST API index (no site url). ` +
+            `Check that the Site URL is this WordPress site's homepage and that no proxy or security plugin is rewriting REST API responses.`,
+          502
+        );
+        continue;
+      }
+      // A blank site title (name: "") is a valid, working connection: the site
+      // host is used as the display label instead of failing the test.
+      const name = typeof data.name === "string" && data.name.trim() ? data.name.trim() : null;
+      return {
+        name: name ?? this.siteUrl,
+        url: data.url,
+        description: typeof data.description === "string" ? data.description : undefined,
+      };
+    }
+
+    throw (
+      lastError ??
+      new WordPressError(
+        `Could not read the WordPress REST API from ${prettyBase} or via ?rest_route=. ` +
+          `Check that the Site URL is your WordPress site's homepage (e.g. https://example.com).`,
+        502
+      )
+    );
   }
 
   async getPostTypes(): Promise<string[]> {
@@ -128,7 +192,7 @@ export class WordPressClient {
 
   async uploadMedia(file: Uint8Array, fileName: string, contentType: string): Promise<{ id: number; source_url: string }> {
     // Media uploads require Content-Disposition with the filename.
-    const url = `${this.restBase}/media`;
+    const url = this.buildUrl("/media");
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), 60_000);
     try {
