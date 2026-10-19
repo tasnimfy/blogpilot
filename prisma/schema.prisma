@@ -1,0 +1,895 @@
+// BlogPilot Prisma schema
+// Default provider: SQLite (portable single-operator deployment).
+// The schema is provider-swappable: set `provider = "postgresql"` and use
+// DATABASE_URL above to run on PostgreSQL. Status/type fields are stored as
+// strings (validated with zod in the app layer) because SQLite has no enums.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "sqlite"
+  url      = env("DATABASE_URL")
+}
+
+// ---------------------------------------------------------------------------
+// Operator / authentication
+// ---------------------------------------------------------------------------
+
+model User {
+  id           String   @id @default(cuid())
+  email        String   @unique
+  passwordHash String
+  name         String?
+  globalRole   String   @default("OPERATOR") // OPERATOR (full access) | MEMBER (site-scoped)
+  isActive     Boolean  @default(true)
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  auditLogs   AuditLog[]
+  memberships WebsiteUserRole[]
+  opportunityApprovals  ContentOpportunity[] @relation("OpportunityApprovals")
+  opportunityRejections ContentOpportunity[] @relation("OpportunityRejections")
+  notifications         Notification[]
+}
+
+// ---------------------------------------------------------------------------
+// Website ownership root. Every site-owned record points to a Website.
+// ---------------------------------------------------------------------------
+
+model Website {
+  id              String   @id @default(cuid())
+  name            String
+  domain          String   @unique
+  url             String
+  description     String?
+  niche           String?
+  targetAudience  String?
+  primaryCountry  String?
+  targetCountries String?
+  primaryLanguage String   @default("en")
+  timezone        String   @default("UTC")
+  status          String   @default("ACTIVE") // ACTIVE | DISABLED | ARCHIVED
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+
+  settings              WebsiteSettings?
+  guidelines            EditorialGuidelines?
+  aiConfiguration       AIProviderConfiguration?
+  wordpressConnection   WordPressConnection?
+  researchConfiguration ResearchConfiguration?
+  keywordBuckets        KeywordBucket[]
+  keywordRecords        KeywordRecord[]
+  importBatches         ImportBatch[]
+  searchConsoleRecords  SearchConsoleRecord[]
+  trendConfigs          TrendMonitoringConfiguration[]
+  trendObservations     TrendObservation[]
+  opportunities         ContentOpportunity[]
+  researchJobs          ResearchJob[]
+  researchSources       ResearchSource[]
+  researchFindings      ResearchFinding[]
+  drafts                ArticleDraft[]
+  images                ImageAsset[]
+  publicationAttempts   PublicationAttempt[]
+  publicationReceipts   PublicationReceipt[]
+  auditLogs             AuditLog[]
+  memberships           WebsiteUserRole[]
+  integrationStatuses   IntegrationStatus[]
+  discoverySettings     DiscoverySettings?
+  discoveryRuns         DiscoveryRun[]
+  generationSchedule    GenerationSchedule?
+  usageRecords          UsageRecord[]
+  notifications         Notification[]
+
+  @@index([status])
+}
+
+// ---------------------------------------------------------------------------
+// Per-website membership / role grants. Membership is scoped to one website;
+// a grant here never applies to any other website.
+// ---------------------------------------------------------------------------
+
+model WebsiteUserRole {
+  id        String  @id @default(cuid())
+  userId    String
+  user      User    @relation(fields: [userId], references: [id], onDelete: Cascade)
+  websiteId String
+  website   Website @relation(fields: [websiteId], references: [id], onDelete: Cascade)
+
+  // OWNER | ADMIN | SEO_MANAGER | EDITOR | WRITER | VIEWER
+  role String
+  // Only meaningful for EDITOR: explicitly permits manual publication.
+  canPublish Boolean @default(false)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@unique([userId, websiteId])
+  @@index([websiteId])
+  @@index([userId])
+}
+
+// ---------------------------------------------------------------------------
+// Integration status / data-collection registry (content research layer).
+// One row per website per data source: KEYWORDS | GSC | TRENDS.
+// Carries both the administrator-facing configuration (enabled, refresh
+// interval, selected provider) and the collection status (last success,
+// sanitized error details, retry/backoff state). Status is derived from
+// actual collection runs; it is never the source of authorization.
+// ---------------------------------------------------------------------------
+
+model IntegrationStatus {
+  id        String  @id @default(cuid())
+  websiteId String
+  website   Website @relation(fields: [websiteId], references: [id], onDelete: Cascade)
+
+  // KEYWORDS | GSC | TRENDS
+  source String
+  // Administrator-facing configuration. providerId selects a registered
+  // provider in the matching registry (see src/providers/*-providers.ts).
+  enabled                 Boolean @default(true)
+  refreshIntervalMinutes  Int     @default(1440)
+  providerId              String? // null => registry default ("unavailable")
+  // IDLE | RUNNING | OK | ERROR | DISABLED
+  status String @default("IDLE")
+
+  lastAttemptAt DateTime?
+  lastSuccessAt DateTime?
+  // Backoff gate so failed syncs retry safely (never a tight loop).
+  nextAttemptAt       DateTime?
+  // Sanitized admin-facing message; never contains credentials.
+  lastError           String?
+  consecutiveFailures Int     @default(0)
+  lastSyncCount       Int?
+  lastDurationMs      Int?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@unique([websiteId, source])
+  @@index([websiteId])
+}
+
+model WebsiteSettings {
+  id        String  @id @default(cuid())
+  websiteId String  @unique
+  website   Website @relation(fields: [websiteId], references: [id], onDelete: Cascade)
+
+  // Content policies
+  defaultPostType        String? @default("post")
+  defaultCategory        String?
+  defaultTags            String?
+  defaultAuthor          String?
+  workflow               String  @default("DRAFT_FIRST") // DRAFT_FIRST | PUBLISH_DIRECT
+  autoSeoMetadata        Boolean @default(true)
+  dynamicTags            Boolean @default(true)
+  imageInsertion         String  @default("MANUAL") // NONE | MANUAL | AUTO
+  researchEnabled        Boolean @default(true)
+  minSources             Int     @default(3)
+  minEditorialScore      Int?
+  defaultArticleLanguage String  @default("en")
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+
+// ---------------------------------------------------------------------------
+// Per-site research configuration
+// ---------------------------------------------------------------------------
+
+model ResearchConfiguration {
+  id        String  @id @default(cuid())
+  websiteId String  @unique
+  website   Website @relation(fields: [websiteId], references: [id], onDelete: Cascade)
+
+  enabled                    Boolean @default(false)
+  researchInstructions       String?
+  permittedDomains           String? // JSON array
+  preferredSourceTypes       String? // JSON array (FORUM | REVIEW | OFFICIAL | NEWS | REDDIT | BLOG ...)
+  communityPlatforms         String? // JSON array (REDDIT | TRIPADVISOR | VIATOR | GETYOURGUIDE | GOOGLE_REVIEWS | FORUM ...)
+  excludedDomains            String? // JSON array
+  requiredOfficialSources    String? // JSON array
+  minIndependentSources      Int     @default(3)
+  researchDepth              Int     @default(2)
+  researchLanguage           String  @default("en")
+  countryScope               String?
+  minSourceQuality           String  @default("MEDIUM") // LOW | MEDIUM | HIGH
+  communityEvidenceMandatory Boolean @default(false)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+
+// ---------------------------------------------------------------------------
+// Editorial guidelines (site-specific AI + writing instructions)
+// ---------------------------------------------------------------------------
+
+model EditorialGuidelines {
+  id        String  @id @default(cuid())
+  websiteId String  @unique
+  website   Website @relation(fields: [websiteId], references: [id], onDelete: Cascade)
+
+  brandVoice         String?
+  writingStyle       String?
+  spellingVariant    String? // en-US | en-GB | ...
+  formalityLevel     String?
+  targetReader       String?
+  readingComplexity  String?
+  contentDepth       String?
+  articleStructure   String?
+  introStyle         String?
+  avoidPhrases       String?
+  verifyClaims       String?
+  internalLinking    String?
+  externalLinking    String?
+  brandInstructions  String?
+  editorialChecklist String?
+  customInstructions String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+
+// ---------------------------------------------------------------------------
+// Per-site AI provider configuration (OpenRouter). Credentials encrypted.
+// ---------------------------------------------------------------------------
+
+model AIProviderConfiguration {
+  id        String  @id @default(cuid())
+  websiteId String  @unique
+  website   Website @relation(fields: [websiteId], references: [id], onDelete: Cascade)
+
+  apiKeyEncrypted        String? // AES-256-GCM ciphertext of the OpenRouter key
+  preferredModel         String?
+  fallbackModel          String?
+  researchModel          String?
+  writingModel           String?
+  seoModel               String?
+  maxOutputTokens        Int?
+  temperature            Float?
+  perTaskOverrides       String? // { outline: "model-x", title: "model-y" }
+  monthlyBudgetCents     Int?
+  maxCostPerArticleCents Int?
+  maxRetries             Int     @default(2)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+
+// ---------------------------------------------------------------------------
+// WordPress connection (Application Passwords over HTTPS). Credentials encrypted.
+// ---------------------------------------------------------------------------
+
+model WordPressConnection {
+  id        String  @id @default(cuid())
+  websiteId String  @unique
+  website   Website @relation(fields: [websiteId], references: [id], onDelete: Cascade)
+
+  siteUrl              String
+  username             String
+  appPasswordEncrypted String? // AES-256-GCM ciphertext
+  status               String    @default("UNKNOWN") // UNKNOWN | OK | FAILED | DISABLED
+  lastTestedAt         DateTime?
+  lastError            String?
+  supportedPostTypes   String?
+  defaultAuthor        String?
+  availableCategories  String?
+  availableTags        String?
+  mediaCapable         Boolean   @default(false)
+  restMetaFields       String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+
+// ---------------------------------------------------------------------------
+// Keyword library
+// ---------------------------------------------------------------------------
+
+model KeywordBucket {
+  id          String   @id @default(cuid())
+  websiteId   String
+  website     Website  @relation(fields: [websiteId], references: [id], onDelete: Cascade)
+  name        String
+  description String?
+  color       String?
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  keywordRecords KeywordRecord[]
+
+  @@unique([websiteId, name])
+  @@index([websiteId])
+}
+
+model KeywordRecord {
+  id        String        @id @default(cuid())
+  websiteId String
+  website   Website       @relation(fields: [websiteId], references: [id], onDelete: Cascade)
+  bucketId  String
+  bucket    KeywordBucket @relation(fields: [bucketId], references: [id], onDelete: Cascade)
+
+  keyword      String
+  searchIntent String? // INFORMATIONAL | COMMERCIAL | NAVIGATIONAL | TRANSACTIONAL
+  country      String?
+  language     String?
+
+  // Metrics (null when unknown, never zero-invented)
+  searchVolume  Int?
+  competition   String? // Google Ads competition label
+  cpcCents      Int?
+  difficulty    Int? // organic difficulty, distinct from Ads competition
+  dateRange     String?
+  source        String? // MANUAL | CSV | GSC | TRENDS | REDDIT | COMPETITOR ...
+  sourceUrl     String?
+  importBatchId String?
+  importBatch   ImportBatch? @relation(fields: [importBatchId], references: [id], onDelete: SetNull)
+  notes         String?
+
+  researchStatus    String  @default("NOT_STARTED") // NOT_STARTED | QUEUED | RESEARCHING | READY
+  opportunityScore  Int?
+  relatedArticleIds String?
+  evidence          String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([websiteId, bucketId])
+  @@index([websiteId, researchStatus])
+}
+
+model ImportBatch {
+  id                String   @id @default(cuid())
+  websiteId         String
+  website           Website  @relation(fields: [websiteId], references: [id], onDelete: Cascade)
+  bucketId          String?
+  source            String // CSV | GSC | TRENDS | MANUAL
+  fileName          String?
+  totalRows         Int
+  importedRows      Int
+  skippedRows       Int
+  failedRows        Int
+  duplicatesSkipped Int
+  status            String   @default("COMPLETED") // RUNNING | COMPLETED | FAILED
+  error             String?
+  createdAt         DateTime @default(now())
+
+  records KeywordRecord[]
+
+  @@index([websiteId])
+}
+
+model SearchConsoleRecord {
+  id        String  @id @default(cuid())
+  websiteId String
+  website   Website @relation(fields: [websiteId], references: [id], onDelete: Cascade)
+
+  query         String
+  page          String?
+  clicks        Int?
+  impressions   Int?
+  ctr           Float?
+  position      Float?
+  date          DateTime?
+  country       String?
+  device        String?
+  source        String    @default("CSV")
+  importBatchId String?
+
+  createdAt DateTime @default(now())
+
+  @@index([websiteId, query])
+}
+
+// ---------------------------------------------------------------------------
+// Google Trends monitoring
+// ---------------------------------------------------------------------------
+
+model TrendMonitoringConfiguration {
+  id        String  @id @default(cuid())
+  websiteId String
+  website   Website @relation(fields: [websiteId], references: [id], onDelete: Cascade)
+  enabled   Boolean @default(true)
+
+  searchTerms     String? // array of terms
+  topicGroups     String?
+  countries       String? // regions
+  frequency       String  @default("DAILY") // DAILY | WEEKLY
+  timeRange       String  @default("90d")
+  category        Int?
+  searchType      String  @default("WEB")
+  changeThreshold Float   @default(30) // % change considered notable
+  autoBucketId    String? // bucket for new discoveries
+  timezone        String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([websiteId, enabled])
+}
+
+model TrendObservation {
+  id            String   @id @default(cuid())
+  websiteId     String
+  website       Website  @relation(fields: [websiteId], references: [id], onDelete: Cascade)
+  configId      String?
+  term          String
+  region        String?
+  timeRange     String?
+  observedOn    DateTime @default(now())
+  value         Int? // relative index
+  previousValue Int?
+  changePct     Float?
+  provider      String? // e.g. "pytrends", "CSV"
+  source        String   @default("TRENDS")
+  raw           String?
+  notable       Boolean  @default(false)
+
+  @@index([websiteId, term, observedOn])
+}
+
+// ---------------------------------------------------------------------------
+// Content opportunities and scoring
+// ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
+// Content opportunity discovery (automated engine, Phase 3)
+// ---------------------------------------------------------------------------
+
+model DiscoverySettings {
+  id        String  @id @default(cuid())
+  websiteId String  @unique
+  website   Website @relation(fields: [websiteId], references: [id], onDelete: Cascade)
+
+  enabled         Boolean  @default(false)
+  region          String? // e.g. "US"; applied where sources support it
+  language        String   @default("en")
+  timeRange       String   @default("90d") // e.g. 30d | 90d | 12m | ALL
+  minScore        Int      @default(12) // 0-25 threshold; below = skipped
+  maxCandidates   Int      @default(50)
+  includeKeywords Boolean  @default(true)
+  includeGsc      Boolean  @default(true)
+  includeTrends   Boolean  @default(true)
+  autoBucketId    String? // bucket for newly discovered keywords (optional)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+
+model DiscoveryRun {
+  id        String  @id @default(cuid())
+  websiteId String
+  website   Website @relation(fields: [websiteId], references: [id], onDelete: Cascade)
+
+  status      String  @default("QUEUED") // QUEUED | RUNNING | COMPLETED | FAILED
+  triggeredBy String  @default("MANUAL") // MANUAL | SCHEDULED
+  settings    String? // snapshot of DiscoverySettings used (JSON)
+
+  candidatesTotal        Int @default(0)
+  opportunitiesCreated   Int @default(0)
+  opportunitiesUpdated   Int @default(0) // matched existing opportunities (dedupe)
+  skippedBelowThreshold  Int @default(0)
+  skippedCovered         Int @default(0)
+  errors                 String? // sanitized
+
+  startedAt   DateTime?
+  completedAt DateTime?
+
+  opportunities ContentOpportunity[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([websiteId, status])
+}
+
+model ContentOpportunity {
+  id        String  @id @default(cuid())
+  websiteId String
+  website   Website @relation(fields: [websiteId], references: [id], onDelete: Cascade)
+
+  title               String
+  keyword             String?
+  bucketId            String?
+  source              String // KEYWORD | GSC | TRENDS | COMMUNITY | MANUAL
+  searchIntent        String?
+  // Likely content type (BLOG_POST | LISTICLE | GUIDE | REVIEW | COMPARISON |
+  // NEWS | FAQ | TUTORIAL | PRODUCT_PAGE), inferred by the discovery engine.
+  contentType String?
+  // Clustered queries that formed this topic (JSON array of strings).
+  keywords String?
+  // Human-review decision by the engine: NEW_ARTICLE | UPDATE_EXISTING.
+  action String?
+  // Provenance: which discovery run produced this opportunity.
+  discoveryRunId String?
+  discoveryRun   DiscoveryRun? @relation(fields: [discoveryRunId], references: [id], onDelete: SetNull)
+  // When action = UPDATE_EXISTING, the draft/page that should be updated.
+  existingDraftId String?
+  existingDraft   ArticleDraft? @relation("OpportunityUpdateTarget", fields: [existingDraftId], references: [id], onDelete: SetNull)
+
+  status              String  @default("NEW") // NEW | SCORED | RESEARCHING | OUTLINE | WRITING | DRAFT | SEO_REVIEW | READY | PUBLISHED | FAILED
+  // Approval workflow state (explicit transitions; see opportunities-workflow).
+  // NEW | REVIEWED | APPROVED | REJECTED | QUEUED_FOR_ARTICLE_STUDIO | GENERATING | DRAFT_READY | FAILED
+  reviewStatus String @default("NEW")
+  commercialIntent    Boolean @default(false)
+  seasonal            Boolean @default(false)
+  existingPageOverlap Boolean @default(false)
+  recommendedAction   String?
+  notes               String?
+
+  // Approval provenance: who decided, when, and why.
+  approvedById    String?
+  approvedBy      User?    @relation("OpportunityApprovals", fields: [approvedById], references: [id], onDelete: SetNull)
+  approvedAt      DateTime?
+  rejectedById    String?
+  rejectedBy      User?    @relation("OpportunityRejections", fields: [rejectedById], references: [id], onDelete: SetNull)
+  rejectedAt      DateTime?
+  rejectionReason String?
+
+  score        OpportunityScore?
+  drafts       ArticleDraft[] @relation("OpportunityDrafts")
+  researchJobs ResearchJob[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([websiteId, status])
+  @@index([websiteId, reviewStatus])
+  @@index([discoveryRunId])
+}
+
+model OpportunityScore {
+  id            String             @id @default(cuid())
+  opportunityId String             @unique
+  opportunity   ContentOpportunity @relation(fields: [opportunityId], references: [id], onDelete: Cascade)
+
+  demandScore              Int // 0-5
+  demandJustification      String
+  competitionScore         Int // 0-5 (higher = more realistic for a NEW site)
+  competitionJustification String
+  valueScore               Int // 0-5
+  valueJustification       String
+  originalScore            Int // 0-5
+  originalJustification    String
+  relevanceScore           Int // 0-5
+  relevanceJustification   String
+  total                    Int // 0-25
+  confidence               String // LOW | MEDIUM | HIGH
+  evidence                 String?
+  sources                  String? // source references
+  isOverride               Boolean @default(false)
+  originalAiScore          String? // preserved original proposal if overridden
+
+  // Discovery engine provenance: data freshness summary and explicit list of
+  // evidence gaps (never fabricated — missing signals are named here).
+  dataFreshness String?
+  missingData   String? // JSON array of missing-signal descriptions
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([total])
+}
+
+// ---------------------------------------------------------------------------
+// Research
+// ---------------------------------------------------------------------------
+
+model ResearchJob {
+  id            String              @id @default(cuid())
+  websiteId     String
+  website       Website             @relation(fields: [websiteId], references: [id], onDelete: Cascade)
+  opportunityId String?
+  opportunity   ContentOpportunity? @relation(fields: [opportunityId], references: [id], onDelete: SetNull)
+  status        String              @default("QUEUED") // QUEUED | RUNNING | COMPLETED | FAILED
+  questions     String?
+  brief         String? // structured research brief
+  error         String?
+  startedAt     DateTime?
+  completedAt   DateTime?
+
+  sources  ResearchSource[]
+  findings ResearchFinding[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([websiteId, status])
+}
+
+model ResearchSource {
+  id            String       @id @default(cuid())
+  websiteId     String
+  website       Website      @relation(fields: [websiteId], references: [id], onDelete: Cascade)
+  researchJobId String?
+  researchJob   ResearchJob? @relation(fields: [researchJobId], references: [id], onDelete: Cascade)
+
+  url        String
+  title      String?
+  sourceType String? // FORUM | REVIEW | OFFICIAL | NEWS | REDDIT | ...
+  accessedAt DateTime @default(now())
+  excerpt    String? // limited excerpt only
+  notes      String?
+
+  findings ResearchFinding[]
+
+  @@index([websiteId])
+}
+
+model ResearchFinding {
+  id            String          @id @default(cuid())
+  websiteId     String
+  website       Website         @relation(fields: [websiteId], references: [id], onDelete: Cascade)
+  researchJobId String?
+  researchJob   ResearchJob?    @relation(fields: [researchJobId], references: [id], onDelete: Cascade)
+  sourceId      String?
+  source        ResearchSource? @relation(fields: [sourceId], references: [id], onDelete: SetNull)
+
+  category String // VERIFIED_FACT | FIRST_HAND | OPINION | THEME | DISAGREEMENT | EXPERT | INFERENCE | UNVERIFIED
+  claim    String
+  evidence String?
+
+  @@index([websiteId])
+}
+
+// ---------------------------------------------------------------------------
+// Article drafts and lifecycle
+// ---------------------------------------------------------------------------
+
+model ArticleDraft {
+  id            String              @id @default(cuid())
+  websiteId     String
+  website       Website             @relation(fields: [websiteId], references: [id], onDelete: Cascade)
+  opportunityId String?
+  opportunity   ContentOpportunity? @relation("OpportunityDrafts", fields: [opportunityId], references: [id], onDelete: SetNull)
+
+  status             String  @default("WRITING") // OPPORTUNITY | RESEARCHING | OUTLINE | WRITING | DRAFT | SEO_REVIEW | READY | PUBLISHING | PUBLISHED | FAILED
+  title              String
+  keyword            String?
+  slug               String?
+  articleType        String?
+  targetLength       Int?
+  language           String?
+  body               String?
+  outline            String? // ArticleOutline stored as JSON on the draft
+  outlineApproved    Boolean @default(false)
+  researchBrief      String?
+  notes              String?
+  publishedReceiptId String?
+
+  // Generated metadata (scheduled AI pipeline). Never auto-published; the
+  // draft stays in Article Studio until a user explicitly publishes it.
+  metaTitle        String?
+  metaDescription  String?
+  relatedKeywords  String? // JSON array of related/clustered queries
+
+  seo                 SEOAnalysis?
+  images              DraftImageAssociation[]
+  revisions           DraftRevision[]
+  publicationAttempts PublicationAttempt[]
+  opportunityUpdates  ContentOpportunity[] @relation("OpportunityUpdateTarget") // discovery: "update this page" targets
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([websiteId, status])
+}
+
+model DraftRevision {
+  id        String       @id @default(cuid())
+  draftId   String
+  draft     ArticleDraft @relation(fields: [draftId], references: [id], onDelete: Cascade)
+  version   Int
+  body      String
+  createdAt DateTime     @default(now())
+
+  @@index([draftId])
+}
+
+model SEOAnalysis {
+  id      String       @id @default(cuid())
+  draftId String       @unique
+  draft   ArticleDraft @relation(fields: [draftId], references: [id], onDelete: Cascade)
+
+  overallScore    Int
+  categories      String?
+  critical        String?
+  warnings        String?
+  suggestions     String?
+  mandatoryFailed Boolean  @default(false)
+  checks          String?
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+}
+
+// ---------------------------------------------------------------------------
+// Images
+// ---------------------------------------------------------------------------
+
+model ImageAsset {
+  id                  String   @id @default(cuid())
+  websiteId           String
+  website             Website  @relation(fields: [websiteId], references: [id], onDelete: Cascade)
+  provider            String // OPENVERSE | WIKIMEDIA | MANUAL
+  providerId          String?
+  url                 String
+  thumbnailUrl        String?
+  title               String?
+  creator             String?
+  attributionRequired Boolean  @default(true)
+  license             String?
+  licenseUrl          String?
+  commercialUse       Boolean  @default(false)
+  width               Int?
+  height              Int?
+  mimeType            String?
+  fileSize            Int?
+  altText             String?
+  wpMediaId           Int?
+  createdAt           DateTime @default(now())
+
+  drafts DraftImageAssociation[]
+
+  @@index([websiteId])
+}
+
+model DraftImageAssociation {
+  id       String       @id @default(cuid())
+  draftId  String
+  draft    ArticleDraft @relation(fields: [draftId], references: [id], onDelete: Cascade)
+  imageId  String
+  image    ImageAsset   @relation(fields: [imageId], references: [id], onDelete: Cascade)
+  role     String       @default("BODY") // FEATURED | BODY
+  position Int?
+  altText  String?
+
+  @@unique([draftId, imageId, role])
+}
+
+// ---------------------------------------------------------------------------
+// Publishing
+// ---------------------------------------------------------------------------
+
+model PublicationAttempt {
+  id        String       @id @default(cuid())
+  websiteId String
+  website   Website      @relation(fields: [websiteId], references: [id], onDelete: Cascade)
+  draftId   String
+  draft     ArticleDraft @relation(fields: [draftId], references: [id], onDelete: Cascade)
+
+  attemptNo      Int      @default(1)
+  idempotencyKey String
+  status         String   @default("STARTED") // STARTED | CREATED | VERIFIED | REQUIRES_RECONCILIATION | FAILED
+  wpPostId       Int?
+  requestSent    Boolean  @default(false)
+  error          String?
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+
+  @@unique([draftId, idempotencyKey])
+  @@index([websiteId, status])
+}
+
+model PublicationReceipt {
+  id          String   @id @default(cuid())
+  websiteId   String
+  website     Website  @relation(fields: [websiteId], references: [id], onDelete: Cascade)
+  draftId     String
+  wpPostId    Int
+  permalink   String
+  publishedAt DateTime
+  status      String // PUBLISHED | DRAFT | PENDING | REQUIRES_RECONCILIATION
+  metadata    String?
+
+  // Minimal receipt only: no article body retained locally.
+  createdAt DateTime @default(now())
+
+  @@unique([websiteId, wpPostId])
+  @@index([websiteId])
+}
+
+// ---------------------------------------------------------------------------
+// Background jobs + audit
+// ---------------------------------------------------------------------------
+
+model BackgroundJob {
+  id           String    @id @default(cuid())
+  websiteId    String?
+  type         String // TRENDS_CHECK | RESEARCH | KEYWORD_PROCESS | ARTICLE_GENERATE
+  status       String    @default("QUEUED") // QUEUED | RUNNING | SUCCEEDED | FAILED
+  payload      String?
+  result       String?
+  error        String?
+  scheduledFor DateTime?
+  startedAt    DateTime?
+  completedAt  DateTime?
+  createdAt    DateTime  @default(now())
+  updatedAt    DateTime  @updatedAt
+
+  // Retry tracking: how many times this job has been claimed/attempted and
+  // when it was last claimed (used for stale-job recovery after crashes).
+  attempts Int       @default(0)
+  lockedAt DateTime?
+
+  @@index([status, scheduledFor])
+}
+
+// ---------------------------------------------------------------------------
+// Scheduled AI article generation (per-website automation). One schedule row
+// per website; conservative default: disabled, one article per day. The
+// pipeline only ever creates unpublished drafts.
+// ---------------------------------------------------------------------------
+model GenerationSchedule {
+  id        String   @id @default(cuid())
+  websiteId String   @unique
+  website   Website  @relation(fields: [websiteId], references: [id], onDelete: Cascade)
+
+  enabled        Boolean @default(false) // master switch (default off = opt-in)
+  schedule       String  @default("03:00") // local HH:MM (24h) when the queue is drained
+  timezone       String? // IANA tz; falls back to Website.timezone, then UTC
+  dailyLimit     Int     @default(1) // conservative: at most one article per day
+  maxPerRun      Int     @default(1) // how many to start in a single scheduler tick
+  maxRetries     Int     @default(2) // automatic re-queues before a job is failed
+  timeoutMinutes Int     @default(30) // RUNNING jobs older than this are recovered as stale
+  weekdayMask    String? // JSON array 0=Sun..6=Sat; null = every day
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+
+// AI usage and cost ledger. Model + token metrics per generation task.
+// Never stores prompts, API keys, or generated content.
+model UsageRecord {
+  id               String   @id @default(cuid())
+  websiteId        String
+  website          Website  @relation(fields: [websiteId], references: [id], onDelete: Cascade)
+  task             String // OUTLINE_GENERATE | ARTICLE_GENERATE | META_GENERATE
+  model            String
+  promptTokens     Int      @default(0)
+  completionTokens Int      @default(0)
+  totalTokens      Int      @default(0)
+  costCents        Int      @default(0) // estimated from usage when a known model rate exists
+  draftId          String?
+  opportunityId    String?
+  jobId            String?
+
+  createdAt DateTime @default(now())
+
+  @@index([websiteId, createdAt])
+  @@index([websiteId, task])
+}
+
+// In-app notifications (generation pipeline events). Read/seen flag only.
+model Notification {
+  id        String   @id @default(cuid())
+  websiteId String?
+  website   Website? @relation(fields: [websiteId], references: [id], onDelete: Cascade)
+  userId    String?
+  user      User?    @relation(fields: [userId], references: [id], onDelete: Cascade)
+  type      String   // GENERATION_DRAFT_READY | GENERATION_FAILED
+  title     String
+  body      String?
+  readAt    DateTime?
+  createdAt DateTime @default(now())
+
+  @@index([userId, readAt])
+  @@index([websiteId, createdAt])
+}
+
+model AuditLog {
+  id        String   @id @default(cuid())
+  userId    String?
+  user      User?    @relation(fields: [userId], references: [id], onDelete: SetNull)
+  websiteId String?
+  website   Website? @relation(fields: [websiteId], references: [id], onDelete: Cascade)
+  action    String
+  entity    String?
+  entityId  String?
+  detail    String?
+  ip        String?
+  createdAt DateTime @default(now())
+
+  @@index([websiteId])
+  @@index([createdAt])
+}

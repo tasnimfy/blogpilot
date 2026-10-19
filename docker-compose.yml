@@ -1,0 +1,42 @@
+services:
+  blogpilot:
+    build: .
+    container_name: blogpilot
+    restart: unless-stopped
+    ports:
+      - "3000:3000"
+    env_file:
+      - .env
+    volumes:
+      - blogpilot-data:/app/data
+    environment:
+      # SQLite inside the container; persist via the named volume.
+      DATABASE_URL: "file:/app/data/blogpilot.db"
+      # Standalone Next.js server conventions.
+      PORT: "3000"
+      HOSTNAME: "0.0.0.0"
+      # Optional: uncomment to run the postgres profile instead.
+      # DATABASE_URL: "postgresql://blogpilot:blogpilot@postgres:5432/blogpilot?schema=public"
+    profiles: [""]
+
+  # Optional PostgreSQL profile: `docker compose --profile postgres up -d --build`
+  postgres:
+    image: postgres:16-alpine
+    container_name: blogpilot-postgres
+    restart: unless-stopped
+    profiles: ["postgres"]
+    environment:
+      POSTGRES_USER: blogpilot
+      POSTGRES_PASSWORD: blogpilot
+      POSTGRES_DB: blogpilot
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U blogpilot"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+volumes:
+  blogpilot-data:
+  postgres-data:

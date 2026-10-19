@@ -1,0 +1,8 @@
+# Force LF everywhere (no CRLF conversion) for deployment-critical files.
+*.sh            text eol=lf
+*.mjs           text eol=lf
+Dockerfile      text eol=lf
+.dockerignore   text eol=lf
+.gitignore      text eol=lf
+*.yml           text eol=lf
+*.yaml          text eol=lf

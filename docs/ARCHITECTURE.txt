@@ -1,0 +1,243 @@
+============================================================================
+ BlogPilot - Multi-Site AI Blogging Operations Platform
+ PROJECT ARCHITECTURE
+ (generated 2026-10-18, audit: 141/141 tests passing)
+============================================================================
+
+------------------------------------------------------------------------------
+1. OVERVIEW
+------------------------------------------------------------------------------
+BlogPilot is a self-hosted, single-operator web application for managing
+multiple niche WordPress blogs from one dashboard. It automates keyword
+management, content-opportunity discovery, Google Trends monitoring, research,
+AI-assisted writing, SEO analysis, image discovery, and WordPress publishing.
+
+Stack:
+  - Next.js 14 (App Router) + TypeScript (strict) + React 18
+  - Tailwind CSS (custom component layer)
+  - Prisma ORM on SQLite by default (provider-swappable to PostgreSQL)
+  - Vitest for tests
+  - No heavy external runtime services required (self-contained)
+
+------------------------------------------------------------------------------
+2. HIGH-LEVEL LAYERS
+------------------------------------------------------------------------------
++---------------------------------------------------------------+
+|  PRESENTATION  (src/app/dashboard/*, src/components/*)        |
+|  Next.js App Router pages, all behind authentication.         |
++---------------------------------------------------------------+
+|  API LAYER     (src/app/api/**/route.ts)                      |
+|  Server route handlers. Every handler guards with requireUser.|
++---------------------------------------------------------------+
+|  DOMAIN/SERVICES (src/server/*.service.ts, src/server/wordpress)|
+|  Business logic; site-scoped queries; validation (zod).       |
++---------------------------------------------------------------+
+|  PROVIDERS     (src/providers/*)                              |
+|  Pluggable adapters: image (Openverse/Wikimedia), research,   |
+|  Google Trends. Honest ok/error results; never fabricate.     |
++---------------------------------------------------------------+
+|  LIB / CORE    (src/lib/*)                                    |
+|  env, prisma singleton, auth, crypto, csv, dynamic tags,      |
+|  markdown, ssrf, json, validation, audit, api error mapping.  |
++---------------------------------------------------------------+
+|  PERSISTENCE   (Prisma -> prisma/blogpilot.db; migrations)    |
++---------------------------------------------------------------+
+
+------------------------------------------------------------------------------
+3. DATA MODEL (prisma/schema.prisma) - ownership root = Website
+------------------------------------------------------------------------------
+Ownership: every site-owned record carries websiteId and cascades on delete.
+No site data is ever shared between websites (enforced in services + tests).
+
+User                    operator account (bcrypt password, sessions)
+Website                 root; name, domain, url, niche, audience, country,
+                        language, timezone, status
+  - WebsiteSettings          content/publishing policies
+  - EditorialGuidelines      brand voice, style, avoid/verify lists, checklist
+  - AIProviderConfiguration  OpenRouter models, budget, encrypted key
+  - WordPressConnection      site URL, username, encrypted app password,
+                             status, taxonomy/media/meta capabilities
+  - ResearchConfiguration    research settings + source presets
+  - KeywordBucket / KeywordRecord / ImportBatch
+  - SearchConsoleRecord
+  - TrendMonitoringConfiguration / TrendObservation
+  - ContentOpportunity / OpportunityScore (5-criterion, 0-25)
+  - ResearchJob / ResearchSource / ResearchFinding
+  - ArticleDraft / DraftRevision / SEOAnalysis
+  - ImageAsset / DraftImageAssociation
+  - PublicationAttempt / PublicationReceipt (minimal, no body)
+  - BackgroundJob / AuditLog
+
+------------------------------------------------------------------------------
+4. MODULES / DOMAINS (feature -> key files)
+------------------------------------------------------------------------------
+AUTH & ACCOUNT
+  - src/lib/auth.ts            bcrypt, HMAC-signed session cookies, requireUser
+  - src/lib/crypto.ts          AES-256-GCM encrypt/decrypt, secret redaction
+  - src/lib/audit.ts           audit logging helper
+  - src/server/account.service.ts   change password, account info
+  - src/app/api/auth/*         login, logout, me, password
+
+MULTI-SITE & PER-SITE SETTINGS
+  - src/server/website.service.ts       site CRUD, status, scoped queries
+  - src/server/settings.service.ts      policies/guidelines/AI/WP settings,
+                                        encrypted credential storage
+  - src/server/research-config.service.ts  per-site research config
+  - src/app/api/websites/...            sites, settings, guidelines, ai, wp
+
+KEYWORD INTELLIGENCE
+  - src/lib/csv.ts, column-mapping.ts  RFC4180 parser, header/column detection
+  - src/server/bucket.service.ts       keyword buckets
+  - src/server/keyword-import.service.ts  CSV import (preview, mapping, dup)
+  - src/server/searchconsole.service.ts   GSC CSV import + opportunity heuristics
+  - src/server/keyword.service.ts      list/filter/sort/paginate, bulk, merge
+  - src/server/opportunity.service.ts  five-criterion scoring + override
+
+RESEARCH & TRENDS
+  - src/providers/*                   adapter contracts + registries
+  - src/server/research.service.ts    research workflow, sources, findings, brief
+  - src/server/trends.service.ts      config CRUD, daily job, no-overlap,
+                                      manual CSV fallback
+
+ARTICLE STUDIO
+  - src/server/prompts.ts             site-specific outline/article prompts
+  - src/server/openrouter.ts          OpenRouter client (server-only, encrypted key)
+  - src/server/article.service.ts     drafts, revisions, outline->article gen
+  - src/lib/dynamic-tags.ts           safe tag registry ([year], [site_name], ...)
+
+SEO & IMAGES
+  - src/server/seo.service.ts         internal SEO analyzer (0-100, local vs live)
+  - src/lib/markdown.ts               markdown structural analysis
+  - src/providers/image-providers.ts  Openverse + Wikimedia adapters + licensing
+  - src/server/image.service.ts       search, save ImageAsset, attribution
+  - src/server/rankmath.service.ts    staged Rank Math compatibility
+
+WORDPRESS PUBLISHING
+  - src/server/wordpress/client.ts            SSRF-safe REST client
+  - src/server/wordpress/connection.service.ts  test connection, capabilities
+  - src/server/wordpress/publish.service.ts   publish, verify, receipt, cleanup,
+                                              idempotency/reconciliation
+
+------------------------------------------------------------------------------
+5. FRONTEND ROUTES (src/app/dashboard)
+------------------------------------------------------------------------------
+  /dashboard              Overview (real DB-backed stats)
+  /dashboard/websites     Websites list + create
+  /dashboard/websites/[id]  Site detail, enable/disable/delete
+  /dashboard/websites/[id]/settings   Content policies
+  /dashboard/websites/[id]/guidelines Editorial guidelines
+  /dashboard/websites/[id]/ai         OpenRouter AI config
+  /dashboard/websites/[id]/wordpress  WP connection + test
+  /dashboard/keywords     Keyword library (buckets, table, filters, import)
+  /dashboard/opportunities  Five-criterion scoring workspace
+  /dashboard/research     Research center (settings + presets)
+  /dashboard/articles     Article Studio (drafts, generate, edit, publish)
+  /dashboard/seo          SEO analyzer
+  /dashboard/publishing   Publishing queue + receipts
+  /dashboard/images       Image library (search + licensing)
+  /dashboard/automation   Trends monitoring + background jobs
+  /dashboard/settings     Global settings (operator account)
+  /login                  Sign in
+
+Shared UI components: src/components/ui.tsx (Button, Card, Input, Badge,
+Field, Alert, EmptyState), SiteSelect, SiteTabs, LogoutButton.
+
+------------------------------------------------------------------------------
+6. BACKEND API ROUTES (src/app/api)
+------------------------------------------------------------------------------
+  /api/auth/*                     login, logout, me, password
+  /api/websites                   list, create
+  /api/websites/[id]              get, update, delete
+  /api/websites/[id]/status       enable/disable/archive
+  /api/websites/[id]/settings, /guidelines, /ai, /wordpress, /wordpress/test
+  /api/websites/[id]/buckets[...]             bucket CRUD
+  /api/websites/[id]/keywords[...]            keyword CRUD/list/bulk/merge
+  /api/websites/[id]/imports/csv[/preview], /gsc
+  /api/websites/[id]/opportunities[...]       + /score, /from-keyword
+  /api/websites/[id]/research/config, /research/jobs[...]
+  /api/websites/[id]/trends[...]              + /import, /observations
+  /api/trends/run-due                         run due Trend checks
+  /api/websites/[id]/drafts[...]              + /outline, /article, /seo, /publish
+  /api/websites/[id]/dynamic-tags/preview
+  /api/websites/[id]/images/search, /images[...]
+  /api/websites/[id]/rankmath/status
+  /api/websites/[id]/receipts, /jobs
+
+Every route (except auth login/logout) calls requireUser() server-side.
+
+------------------------------------------------------------------------------
+7. SECURITY MODEL
+------------------------------------------------------------------------------
+  - Sessions: bcrypt(12) + HMAC-SHA256-signed HttpOnly SameSite=Lax cookies
+    with 7-day expiry; verified on every protected request.
+  - Credentials (OpenRouter keys, WP app passwords): AES-256-GCM encrypted at
+    rest using APP_ENC_KEY held OUTSIDE the database. Only a boolean
+    hasApiKey/hasAppPassword is returned to the browser; redactSecrets() guards
+    logs; never sent to the client after initial submission.
+  - Site isolation: every service query filters by websiteId; cascade FKs.
+  - Input validation: zod on all API bodies; Prisma parameterized queries;
+    provider/CSV/WordPress output treated as untrusted data.
+  - SSRF: isSafeOutboundUrl() blocks localhost, private/loopback/link-local,
+    and cloud-metadata addresses (applied to WP and image-download requests).
+  - Audit logging for sensitive actions. .env and DB files are gitignored.
+  - Known gaps (documented, not claimed): rate limiting, explicit CSRF tokens,
+    CI dependency scanning.
+
+------------------------------------------------------------------------------
+8. INTEGRATION HONESTY
+------------------------------------------------------------------------------
+  Provider adapters return explicit { ok: true, ... } | { ok: false, error }
+  and never fabricate results. Where an automated provider is unavailable
+  (Google Trends, research search) the app reports that limitation and
+  supports manual CSV import / manual source entry.
+
+  Live-verified vs mock-verified (see docs/AUDIT.md §5):
+    - Openverse image search ..... live-verified (real results returned)
+    - Wikimedia .................. implemented, mock-tested only
+    - OpenRouter ................. implemented, mock/stub-tested only
+    - WordPress .................. implemented, mock-tested; live WP untested
+    - Google Trends / research ... honest unavailability + manual fallback
+    - Rank Math .................. staged detection/mapping, no live WP probe
+
+------------------------------------------------------------------------------
+9. TESTS (tests/ - 141 tests, 23 files)
+------------------------------------------------------------------------------
+  auth, crypto, csv, dynamic-tags, markdown(implicit), ssrf (in rankmath),
+  website, settings, bucket, keyword-import, keyword, searchconsole,
+  opportunity, research-config, research, trends, article, prompts,
+  openrouter, seo, image-providers, rankmath, publish, wordpress-connection,
+  account.
+
+  Test DB: separate SQLite file (prisma/test.db) recreated by global setup.
+  External services are mocked; real-credential integration instructions are
+  in docs/INTEGRATIONS.md.
+
+------------------------------------------------------------------------------
+10. SCRIPTS (package.json)
+------------------------------------------------------------------------------
+  dev, build, start, lint (eslint), typecheck (tsc --noEmit),
+  test / test:watch / test:create-db, prisma:generate / migrate / deploy /
+  studio, db:reset, seed-admin (node scripts/seed-admin.mjs)
+
+------------------------------------------------------------------------------
+11. DIRECTORY MAP (key paths)
+------------------------------------------------------------------------------
+  prisma/schema.prisma, prisma/migrations/...
+  src/lib/*        env, prisma, auth, crypto, json, csv, column-mapping,
+                   dynamic-tags, markdown, ssrf, validation, api, audit
+  src/server/*.service.ts        business logic
+  src/server/wordpress/*         WP client, connection, publish
+  src/providers/*                image / research / trends adapters
+  src/app/api/**/route.ts        REST API
+  src/app/dashboard/**           UI pages
+  src/components/*               shared UI
+  tests/*                        Vitest suites
+  scripts/*                      seed, reset-db, init-test-db
+  docs/*                         DEPLOYMENT, DATABASE, INTEGRATIONS, SECURITY,
+                                 KNOWN_LIMITATIONS, IMPLEMENTATION_REPORT, AUDIT
+  Dockerfile, docker-compose.yml, docker/entrypoint.sh
+  .env.example                   env template (no real secrets)
+
+============================================================================
+ END OF ARCHITECTURE DOCUMENT
+============================================================================
